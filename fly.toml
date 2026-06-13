@@ -1,6 +1,6 @@
 # fly.toml - Configuracion de Fly.io para azuracast-mcp-fly
 app = 'azuracast-mcp-fly'
-primary_region = 'mia'  # Miami - mas cercano a Mexico
+primary_region = 'dfw'  # Dallas - mia esta deprecado
 
 [build]
   dockerfile = 'Dockerfile'
