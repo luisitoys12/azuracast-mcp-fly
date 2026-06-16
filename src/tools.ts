@@ -1,14 +1,20 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { execFile, exec } from "child_process";
+import { promisify } from "util";
+import { readFile, unlink, readdir } from "fs/promises";
+import { join } from "path";
+
+const execFileAsync = promisify(execFile);
+const execAsync = promisify(exec);
 
 const AZURA_URL = (process.env.AZURACAST_URL ?? "").replace(/\/$/, "");
 const AZURA_KEY = process.env.AZURACAST_API_KEY ?? "";
+const DOWNLOAD_DIR = process.env.DOWNLOAD_DIR ?? "/tmp/downloads";
 
 export function validateEnv() {
   if (!AZURA_URL || !AZURA_KEY) {
-    throw new Error(
-      "Faltan variables de entorno: AZURACAST_URL y AZURACAST_API_KEY"
-    );
+    throw new Error("Faltan variables de entorno: AZURACAST_URL y AZURACAST_API_KEY");
   }
 }
 
@@ -31,24 +37,57 @@ async function azuraFetch(path: string, options: RequestInit = {}) {
 
 function normalizeText(str: string): string {
   if (!str) return "";
-  return str
-    .trim()
-    .replace(/\s+/g, " ")
-    .split(" ")
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
-    .join(" ");
+  return str.trim().replace(/\s+/g, " ")
+    .split(" ").map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(" ");
+}
+
+async function uploadFileToAzura(
+  filePath: string,
+  stationId: string | number,
+  subfolder: string,
+  metaTitle?: string,
+  metaArtist?: string
+): Promise<Record<string, unknown>> {
+  const fileName = filePath.split("/").pop() ?? "track.mp3";
+  const fileBuffer = await readFile(filePath);
+  const formData = new FormData();
+  const blob = new Blob([fileBuffer], { type: "audio/mpeg" });
+  const uploadPath = subfolder ? `${subfolder}/${fileName}` : fileName;
+  formData.append("file", blob, uploadPath);
+
+  const uploadRes = await fetch(`${AZURA_URL}/api/station/${stationId}/files`, {
+    method: "POST",
+    headers: { "X-API-Key": AZURA_KEY },
+    body: formData,
+  });
+  if (!uploadRes.ok) {
+    const errText = await uploadRes.text();
+    throw new Error(`Error al subir a AzuraCast: ${uploadRes.status} - ${errText}`);
+  }
+  const uploaded = await uploadRes.json() as Record<string, unknown>;
+
+  if (uploaded.id && (metaTitle || metaArtist)) {
+    const metaBody: Record<string, string> = {};
+    if (metaTitle) metaBody["title"] = normalizeText(metaTitle);
+    if (metaArtist) metaBody["artist"] = normalizeText(metaArtist);
+    await azuraFetch(`/api/station/${stationId}/file/${uploaded.id}`, {
+      method: "PUT",
+      body: JSON.stringify(metaBody),
+    });
+  }
+  await unlink(filePath).catch(() => {});
+  return uploaded;
 }
 
 export function registerTools(server: McpServer) {
-  server.tool(
-    "get_nowplaying",
-    "Obtiene el now playing actual de una o todas las estaciones. Retorna artista, titulo, portada, duracion y oyentes.",
-    {
-      station_id: z
-        .union([z.string(), z.number()])
-        .optional()
-        .describe("ID o shortcode (opcional = todas las estaciones)"),
-    },
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // TOOLS ORIGINALES
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  server.tool("get_nowplaying",
+    "Obtiene el now playing actual de una o todas las estaciones.",
+    { station_id: z.union([z.string(), z.number()]).optional().describe("ID o shortcode (opcional = todas)") },
     async ({ station_id }) => {
       const path = station_id ? `/api/nowplaying/${station_id}` : "/api/nowplaying";
       const data = await azuraFetch(path);
@@ -71,17 +110,14 @@ export function registerTools(server: McpServer) {
     }
   );
 
-  server.tool(
-    "get_song_history",
+  server.tool("get_song_history",
     "Obtiene el historial reciente de canciones de una estacion.",
     {
       station_id: z.union([z.string(), z.number()]).describe("ID o shortcode"),
       rows: z.number().optional().default(10).describe("Cantidad (default 10)"),
     },
     async ({ station_id, rows }) => {
-      const data = (await azuraFetch(
-        `/api/station/${station_id}/history?rows=${rows}`
-      )) as Array<Record<string, unknown>>;
+      const data = (await azuraFetch(`/api/station/${station_id}/history?rows=${rows}`)) as Array<Record<string, unknown>>;
       const result = data.map((entry) => {
         const song = (entry.song ?? {}) as Record<string, string>;
         return {
@@ -95,16 +131,11 @@ export function registerTools(server: McpServer) {
     }
   );
 
-  server.tool(
-    "list_stations",
-    "Lista todas las estaciones configuradas en AzuraCast.",
-    {},
+  server.tool("list_stations", "Lista todas las estaciones configuradas en AzuraCast.", {},
     async () => {
       const data = (await azuraFetch("/api/stations")) as Array<Record<string, unknown>>;
       const result = data.map((s) => ({
-        id: s.id,
-        shortcode: s.shortcode,
-        name: s.name,
+        id: s.id, shortcode: s.shortcode, name: s.name,
         is_public: s.is_public,
         listen_url: (s.listen_urls as Record<string, string>)?.http ?? "",
       }));
@@ -112,9 +143,7 @@ export function registerTools(server: McpServer) {
     }
   );
 
-  server.tool(
-    "get_station",
-    "Obtiene detalles de una estacion especifica.",
+  server.tool("get_station", "Obtiene detalles de una estacion especifica.",
     { station_id: z.union([z.string(), z.number()]).describe("ID o shortcode") },
     async ({ station_id }) => {
       const data = await azuraFetch(`/api/station/${station_id}`);
@@ -122,33 +151,24 @@ export function registerTools(server: McpServer) {
     }
   );
 
-  server.tool(
-    "list_media",
-    "Lista los archivos de media de una estacion para auditar metadata.",
+  server.tool("list_media", "Lista los archivos de media de una estacion.",
     {
       station_id: z.union([z.string(), z.number()]).describe("ID o shortcode"),
       page: z.number().optional().default(1),
       per_page: z.number().optional().default(25),
     },
     async ({ station_id, page, per_page }) => {
-      const data = await azuraFetch(
-        `/api/station/${station_id}/files?page=${page}&per_page=${per_page}`
-      );
+      const data = await azuraFetch(`/api/station/${station_id}/files?page=${page}&per_page=${per_page}`);
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     }
   );
 
-  server.tool(
-    "update_media_metadata",
-    "Actualiza el metadata (artista, titulo, album, genero, ano) de un track.",
+  server.tool("update_media_metadata", "Actualiza el metadata de un track en AzuraCast.",
     {
       station_id: z.union([z.string(), z.number()]).describe("ID o shortcode"),
       media_id: z.union([z.string(), z.number()]).describe("ID del archivo"),
-      artist: z.string().optional(),
-      title: z.string().optional(),
-      album: z.string().optional(),
-      genre: z.string().optional(),
-      year: z.string().optional(),
+      artist: z.string().optional(), title: z.string().optional(),
+      album: z.string().optional(), genre: z.string().optional(), year: z.string().optional(),
     },
     async ({ station_id, media_id, ...fields }) => {
       const body: Record<string, unknown> = {};
@@ -157,17 +177,12 @@ export function registerTools(server: McpServer) {
       if (fields.album !== undefined) body["album"] = fields.album;
       if (fields.genre !== undefined) body["genre"] = fields.genre;
       if (fields.year !== undefined) body["year"] = fields.year;
-      const data = await azuraFetch(`/api/station/${station_id}/file/${media_id}`, {
-        method: "PUT",
-        body: JSON.stringify(body),
-      });
+      const data = await azuraFetch(`/api/station/${station_id}/file/${media_id}`, { method: "PUT", body: JSON.stringify(body) });
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     }
   );
 
-  server.tool(
-    "restart_station",
-    "Reinicia una estacion de AzuraCast.",
+  server.tool("restart_station", "Reinicia una estacion de AzuraCast.",
     { station_id: z.union([z.string(), z.number()]).describe("ID o shortcode") },
     async ({ station_id }) => {
       const data = await azuraFetch(`/api/station/${station_id}/restart`, { method: "POST" });
@@ -175,13 +190,163 @@ export function registerTools(server: McpServer) {
     }
   );
 
-  server.tool(
-    "skip_song",
-    "Salta la cancion actual en una estacion (requiere AutoDJ activo).",
+  server.tool("skip_song", "Salta la cancion actual en una estacion (requiere AutoDJ activo).",
     { station_id: z.union([z.string(), z.number()]).describe("ID o shortcode") },
     async ({ station_id }) => {
       const data = await azuraFetch(`/api/station/${station_id}/backend/skip`, { method: "POST" });
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // NUEVAS TOOLS: DESCARGA
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  server.tool("download_track",
+    "Descarga un track de cualquier URL soportada por yt-dlp (iVoox, YouTube, SoundCloud, Mixcloud, etc.) y lo sube directamente a AzuraCast.",
+    {
+      url: z.string().url().describe("URL del audio (iVoox, YouTube, SoundCloud, etc.)"),
+      station_id: z.union([z.string(), z.number()]).describe("ID o shortcode de la estacion destino"),
+      title: z.string().optional().describe("Titulo del track (opcional)"),
+      artist: z.string().optional().describe("Artista (opcional)"),
+      subfolder: z.string().optional().default("").describe("Subcarpeta destino en AzuraCast (ej: 'podcasts')"),
+    },
+    async ({ url, station_id, title, artist, subfolder }) => {
+      const outTemplate = join(DOWNLOAD_DIR, "ytdlp_%(id)s.%(ext)s");
+      await execFileAsync("yt-dlp", [
+        "-x", "--audio-format", "mp3", "--audio-quality", "0",
+        "--no-playlist", "--output", outTemplate, url,
+      ]);
+      const files = (await readdir(DOWNLOAD_DIR)).filter(f => f.startsWith("ytdlp_") && f.endsWith(".mp3"));
+      if (!files.length) throw new Error("yt-dlp no generó ningún archivo mp3.");
+      const filePath = join(DOWNLOAD_DIR, files[files.length - 1]);
+      const uploaded = await uploadFileToAzura(filePath, station_id, subfolder ?? "", title, artist);
+      return {
+        content: [{ type: "text", text: JSON.stringify({
+          success: true,
+          message: `Track descargado y subido a estacion ${station_id}`,
+          file: files[files.length - 1],
+          azuracast_id: uploaded.id ?? null,
+        }, null, 2) }],
+      };
+    }
+  );
+
+  server.tool("download_playlist_ytdlp",
+    "Descarga una playlist completa desde YouTube, SoundCloud u otras plataformas soportadas por yt-dlp y sube todos los tracks a AzuraCast. Ideal para importar podcasts o programas completos.",
+    {
+      url: z.string().url().describe("URL de la playlist o canal"),
+      station_id: z.union([z.string(), z.number()]).describe("ID o shortcode de la estacion destino"),
+      subfolder: z.string().optional().default("").describe("Subcarpeta destino en AzuraCast"),
+      max_tracks: z.number().optional().default(20).describe("Maximo de tracks a descargar (default 20)"),
+    },
+    async ({ url, station_id, subfolder, max_tracks }) => {
+      const outTemplate = join(DOWNLOAD_DIR, "pl_%(playlist_index)s_%(id)s.%(ext)s");
+      await execFileAsync("yt-dlp", [
+        "-x", "--audio-format", "mp3", "--audio-quality", "0",
+        "--playlist-end", String(max_tracks),
+        "--output", outTemplate, url,
+      ]);
+      const files = (await readdir(DOWNLOAD_DIR)).filter(f => f.startsWith("pl_") && f.endsWith(".mp3"));
+      if (!files.length) throw new Error("No se descargó ningún archivo.");
+      const results = [];
+      for (const file of files) {
+        const filePath = join(DOWNLOAD_DIR, file);
+        try {
+          const uploaded = await uploadFileToAzura(filePath, station_id, subfolder ?? "");
+          results.push({ file, azuracast_id: uploaded.id ?? null, status: "ok" });
+        } catch (e) {
+          results.push({ file, status: "error", error: String(e) });
+        }
+      }
+      return {
+        content: [{ type: "text", text: JSON.stringify({
+          success: true,
+          total: results.length,
+          tracks: results,
+        }, null, 2) }],
+      };
+    }
+  );
+
+  server.tool("download_tidal",
+    "Descarga un track, album o playlist de Tidal usando streamrip y lo sube a AzuraCast. Requiere TIDAL_ACCESS_TOKEN configurado en Fly secrets.",
+    {
+      url: z.string().url().describe("URL de Tidal (track, album o playlist)"),
+      station_id: z.union([z.string(), z.number()]).describe("ID o shortcode de la estacion destino"),
+      subfolder: z.string().optional().default("tidal").describe("Subcarpeta destino (default: 'tidal')"),
+    },
+    async ({ url, station_id, subfolder }) => {
+      // Inyectar credenciales desde env vars si existen
+      const tidalToken = process.env.TIDAL_ACCESS_TOKEN ?? "";
+      const tidalRefresh = process.env.TIDAL_REFRESH_TOKEN ?? "";
+      if (!tidalToken) throw new Error("Falta TIDAL_ACCESS_TOKEN en Fly secrets. Configura: fly secrets set TIDAL_ACCESS_TOKEN=xxx");
+
+      // Parchear config de streamrip con token
+      const configPatch = `[tidal]\naccess_token = "${tidalToken}"\nrefresh_token = "${tidalRefresh}"\nquality = 1\n`;
+      const { writeFile } = await import("fs/promises");
+      await writeFile("/root/.config/streamrip/config.toml", configPatch);
+
+      await execAsync(`rip url "${url}"`);
+
+      // Buscar archivos descargados
+      const files = (await readdir(DOWNLOAD_DIR)).filter(f => f.endsWith(".mp3") || f.endsWith(".flac"));
+      if (!files.length) throw new Error("streamrip no generó archivos de audio.");
+
+      const results = [];
+      for (const file of files) {
+        const filePath = join(DOWNLOAD_DIR, file);
+        try {
+          const uploaded = await uploadFileToAzura(filePath, station_id, subfolder ?? "tidal");
+          results.push({ file, azuracast_id: uploaded.id ?? null, status: "ok" });
+        } catch (e) {
+          results.push({ file, status: "error", error: String(e) });
+        }
+      }
+      return {
+        content: [{ type: "text", text: JSON.stringify({
+          success: true, source: "tidal", total: results.length, tracks: results,
+        }, null, 2) }],
+      };
+    }
+  );
+
+  server.tool("download_qobuz",
+    "Descarga un track, album o playlist de Qobuz usando streamrip y lo sube a AzuraCast. Requiere QOBUZ_EMAIL y QOBUZ_PASSWORD en Fly secrets.",
+    {
+      url: z.string().url().describe("URL de Qobuz (track, album o playlist)"),
+      station_id: z.union([z.string(), z.number()]).describe("ID o shortcode de la estacion destino"),
+      subfolder: z.string().optional().default("qobuz").describe("Subcarpeta destino (default: 'qobuz')"),
+    },
+    async ({ url, station_id, subfolder }) => {
+      const email = process.env.QOBUZ_EMAIL ?? "";
+      const password = process.env.QOBUZ_PASSWORD ?? "";
+      if (!email || !password) throw new Error("Faltan QOBUZ_EMAIL y QOBUZ_PASSWORD en Fly secrets.");
+
+      const configPatch = `[qobuz]\nemail_or_userid = "${email}"\npassword_or_token = "${password}"\nquality = 1\n`;
+      const { writeFile } = await import("fs/promises");
+      await writeFile("/root/.config/streamrip/config.toml", configPatch);
+
+      await execAsync(`rip url "${url}"`);
+
+      const files = (await readdir(DOWNLOAD_DIR)).filter(f => f.endsWith(".mp3") || f.endsWith(".flac"));
+      if (!files.length) throw new Error("streamrip no generó archivos de audio.");
+
+      const results = [];
+      for (const file of files) {
+        const filePath = join(DOWNLOAD_DIR, file);
+        try {
+          const uploaded = await uploadFileToAzura(filePath, station_id, subfolder ?? "qobuz");
+          results.push({ file, azuracast_id: uploaded.id ?? null, status: "ok" });
+        } catch (e) {
+          results.push({ file, status: "error", error: String(e) });
+        }
+      }
+      return {
+        content: [{ type: "text", text: JSON.stringify({
+          success: true, source: "qobuz", total: results.length, tracks: results,
+        }, null, 2) }],
+      };
     }
   );
 }

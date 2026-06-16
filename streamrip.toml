@@ -1,0 +1,47 @@
+# Configuracion de streamrip - sobreescribir credenciales via env vars o fly secrets
+# https://github.com/nathom/streamrip
+
+[downloads]
+folder = "/tmp/downloads"
+subfolder_separator = "/"
+download_booklets = false
+concurrency = true
+max_connections = 3
+
+[conversion]
+enabled = true
+codec = "MP3"
+sampling_rate = 44100
+bit_depth = 16
+lossless_to_mp3 = true
+
+[qobuz]
+email_or_userid = ""
+password_or_token = ""
+quality = 1
+
+[tidal]
+email = ""
+password = ""
+quality = 1
+access_token = ""
+refresh_token = ""
+token_expiry = ""
+
+[deezer]
+arl = ""
+quality = 1
+
+[soundcloud]
+quality = 0
+client_id = ""
+app_version = ""
+
+[database]
+downloads_enabled = false
+failed_downloads_enabled = false
+
+[cli]
+text_output = true
+progress_bars = false
+max_search_results = 20

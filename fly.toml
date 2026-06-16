@@ -1,6 +1,6 @@
-# fly.toml - Configuracion de Fly.io para azuracast-mcp-fly
+# fly.toml - azuracast-mcp-fly (Advanced MCP con yt-dlp + streamrip)
 app = 'azuracast-mcp-fly'
-primary_region = 'dfw'  # Dallas
+primary_region = 'dfw'
 
 [build]
   dockerfile = 'Dockerfile'
@@ -18,11 +18,11 @@ primary_region = 'dfw'  # Dallas
 
   [http_service.concurrency]
     type = 'requests'
-    soft_limit = 100
-    hard_limit = 200
+    soft_limit = 50
+    hard_limit = 100
 
 [[vm]]
-  memory = '256mb'
+  memory = '512mb'
   cpu_kind = 'shared'
   cpus = 1
 
@@ -31,7 +31,7 @@ primary_region = 'dfw'  # Dallas
     port = 8080
     type = 'http'
     interval = '30s'
-    timeout = '5s'
-    grace_period = '10s'
+    timeout = '10s'
+    grace_period = '15s'
     method = 'get'
     path = '/health'
