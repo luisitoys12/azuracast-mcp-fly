@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { execFile, exec } from "child_process";
 import { promisify } from "util";
-import { unlink, readdir, stat } from "fs/promises";
+import { unlink, readdir, stat, mkdir } from "fs/promises";
 import { join } from "path";
 
 const execFileAsync = promisify(execFile);
@@ -12,12 +12,36 @@ const AZURA_URL = (process.env.AZURACAST_URL ?? "").replace(/\/$/, "");
 const AZURA_KEY = process.env.AZURACAST_API_KEY ?? "";
 const DOWNLOAD_DIR = process.env.DOWNLOAD_DIR ?? "/tmp/downloads";
 
+// ── Job queue (in-memory) ──────────────────────────────────────────────────
+type JobStatus = "pending" | "downloading" | "uploading" | "done" | "error";
+interface Job {
+  id: string;
+  status: JobStatus;
+  message: string;
+  result?: Record<string, unknown>;
+  createdAt: number;
+}
+const jobs = new Map<string, Job>();
+
+function createJob(): Job {
+  const id = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const job: Job = { id, status: "pending", message: "En cola...", createdAt: Date.now() };
+  jobs.set(id, job);
+  // Limpiar jobs viejos (> 2 horas)
+  for (const [k, v] of jobs) {
+    if (Date.now() - v.createdAt > 7_200_000) jobs.delete(k);
+  }
+  return job;
+}
+
+// ── Env ───────────────────────────────────────────────────────────────────
 export function validateEnv() {
   if (!AZURA_URL || !AZURA_KEY) {
     throw new Error("Faltan variables de entorno: AZURACAST_URL y AZURACAST_API_KEY");
   }
 }
 
+// ── AzuraCast fetch ───────────────────────────────────────────────────────
 async function azuraFetch(path: string, options: RequestInit = {}) {
   const url = `${AZURA_URL}${path}`;
   const res = await fetch(url, {
@@ -41,7 +65,7 @@ function normalizeText(str: string): string {
     .split(" ").map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(" ");
 }
 
-// Upload via curl — stream directo disco -> AzuraCast, sin cargar en RAM de Node
+// ── Upload via curl ───────────────────────────────────────────────────────
 async function uploadFileToAzura(
   filePath: string,
   stationId: string | number,
@@ -74,8 +98,7 @@ async function uploadFileToAzura(
   return uploaded;
 }
 
-// yt-dlp con execFile (array de args) — SIN pasar por /bin/sh
-// %(ext)s va directo al proceso, el shell NUNCA lo ve
+// ── yt-dlp ────────────────────────────────────────────────────────────────
 async function ytdlpDownload(url: string, outputTemplate: string, extraArgs: string[] = []): Promise<void> {
   const args = [
     "-x",
@@ -93,11 +116,61 @@ async function ytdlpDownload(url: string, outputTemplate: string, extraArgs: str
 
   await execFileAsync("yt-dlp", args, {
     maxBuffer: 512 * 1024,
-    timeout: 300000,
+    timeout: 600_000,
     env: { ...process.env, MALLOC_ARENA_MAX: "2" },
   });
 }
 
+// ── Background worker ─────────────────────────────────────────────────────
+async function runDownloadJob(
+  job: Job,
+  url: string,
+  stationId: string | number,
+  subfolder: string,
+  title?: string,
+  artist?: string
+) {
+  try {
+    await mkdir(DOWNLOAD_DIR, { recursive: true });
+
+    job.status = "downloading";
+    job.message = "Descargando con yt-dlp...";
+    console.log(`[job:${job.id}] Descargando: ${url}`);
+
+    const fileId = `ytdlp_${job.id}`;
+    const outTemplate = join(DOWNLOAD_DIR, `${fileId}.%(ext)s`);
+    await ytdlpDownload(url, outTemplate);
+
+    const files = (await readdir(DOWNLOAD_DIR)).filter(f => f.startsWith(fileId));
+    if (!files.length) throw new Error("yt-dlp no genero ningun archivo.");
+
+    const filePath = join(DOWNLOAD_DIR, files[0]);
+    const fileStats = await stat(filePath);
+
+    job.status = "uploading";
+    job.message = `Subiendo a AzuraCast (${(fileStats.size / 1024 / 1024).toFixed(1)} MB)...`;
+    console.log(`[job:${job.id}] Subiendo: ${files[0]} (${job.message})`);
+
+    const uploaded = await uploadFileToAzura(filePath, stationId, subfolder, title, artist);
+
+    job.status = "done";
+    job.message = `Track subido correctamente a estacion ${stationId}`;
+    job.result = {
+      success: true,
+      file: files[0],
+      size_mb: (fileStats.size / 1024 / 1024).toFixed(2),
+      azuracast_id: uploaded.id ?? null,
+      station_id: stationId,
+    };
+    console.log(`[job:${job.id}] DONE: azuracast_id=${uploaded.id}`);
+  } catch (err) {
+    job.status = "error";
+    job.message = err instanceof Error ? err.message : String(err);
+    console.error(`[job:${job.id}] ERROR: ${job.message}`);
+  }
+}
+
+// ── Tools ─────────────────────────────────────────────────────────────────
 export function registerTools(server: McpServer) {
 
   server.tool("get_nowplaying",
@@ -213,8 +286,9 @@ export function registerTools(server: McpServer) {
     }
   );
 
+  // ── download_track (ASYNC) ────────────────────────────────────────────────
   server.tool("download_track",
-    "Descarga un track de cualquier URL soportada por yt-dlp (iVoox, YouTube, SoundCloud, Mixcloud, etc.) y lo sube directamente a AzuraCast.",
+    "Inicia la descarga en background de un track desde cualquier URL soportada por yt-dlp y lo sube a AzuraCast. Responde inmediatamente con un job_id. Usa get_download_status para consultar el progreso.",
     {
       url: z.string().url().describe("URL del audio (iVoox, YouTube, SoundCloud, etc.)"),
       station_id: z.union([z.string(), z.number()]).describe("ID o shortcode de la estacion destino"),
@@ -223,32 +297,45 @@ export function registerTools(server: McpServer) {
       subfolder: z.string().optional().default("").describe("Subcarpeta destino en AzuraCast (ej: 'podcasts')"),
     },
     async ({ url, station_id, title, artist, subfolder }) => {
-      const fileId = `ytdlp_${Date.now()}`;
-      const outTemplate = join(DOWNLOAD_DIR, `${fileId}.%(ext)s`);
-
-      await ytdlpDownload(url, outTemplate);
-
-      const files = (await readdir(DOWNLOAD_DIR)).filter(f => f.startsWith(fileId));
-      if (!files.length) throw new Error("yt-dlp no genero ningun archivo.");
-      const filePath = join(DOWNLOAD_DIR, files[0]);
-      const fileStats = await stat(filePath);
-
-      const uploaded = await uploadFileToAzura(filePath, station_id, subfolder ?? "", title, artist);
-
+      const job = createJob();
+      // Lanzar en background — NO await
+      runDownloadJob(job, url, station_id, subfolder ?? "", title, artist);
       return {
         content: [{ type: "text", text: JSON.stringify({
-          success: true,
-          message: `Track descargado y subido a estacion ${station_id}`,
-          file: files[0],
-          size_mb: (fileStats.size / 1024 / 1024).toFixed(2),
-          azuracast_id: uploaded.id ?? null,
+          job_id: job.id,
+          status: job.status,
+          message: "Descarga iniciada en background. Usa get_download_status con este job_id para ver el progreso.",
         }, null, 2) }],
       };
     }
   );
 
+  // ── get_download_status ───────────────────────────────────────────────────
+  server.tool("get_download_status",
+    "Consulta el estado de un job de descarga iniciado con download_track o download_playlist_ytdlp.",
+    {
+      job_id: z.string().describe("ID del job retornado por download_track"),
+    },
+    async ({ job_id }) => {
+      const job = jobs.get(job_id);
+      if (!job) {
+        return { content: [{ type: "text", text: JSON.stringify({ error: "Job no encontrado", job_id }) }] };
+      }
+      return {
+        content: [{ type: "text", text: JSON.stringify({
+          job_id: job.id,
+          status: job.status,
+          message: job.message,
+          result: job.result ?? null,
+          elapsed_seconds: Math.round((Date.now() - job.createdAt) / 1000),
+        }, null, 2) }],
+      };
+    }
+  );
+
+  // ── download_playlist_ytdlp (ASYNC) ───────────────────────────────────────
   server.tool("download_playlist_ytdlp",
-    "Descarga una playlist completa desde YouTube, SoundCloud u otras plataformas soportadas por yt-dlp y sube todos los tracks a AzuraCast.",
+    "Descarga una playlist completa en background y sube todos los tracks a AzuraCast. Retorna job_id para consultar progreso con get_download_status.",
     {
       url: z.string().url().describe("URL de la playlist o canal"),
       station_id: z.union([z.string(), z.number()]).describe("ID o shortcode de la estacion destino"),
@@ -256,27 +343,49 @@ export function registerTools(server: McpServer) {
       max_tracks: z.number().optional().default(20).describe("Maximo de tracks a descargar (default 20)"),
     },
     async ({ url, station_id, subfolder, max_tracks }) => {
-      const batchId = `pl_${Date.now()}`;
-      const outTemplate = join(DOWNLOAD_DIR, `${batchId}_%(playlist_index)s.%(ext)s`);
+      const job = createJob();
 
-      await ytdlpDownload(url, outTemplate, ["--playlist-end", String(max_tracks)]);
-
-      const files = (await readdir(DOWNLOAD_DIR)).filter(f => f.startsWith(batchId));
-      if (!files.length) throw new Error("No se descargo ningun archivo.");
-
-      const results = [];
-      for (const file of files.sort()) {
-        const filePath = join(DOWNLOAD_DIR, file);
+      // Background
+      (async () => {
         try {
-          const uploaded = await uploadFileToAzura(filePath, station_id, subfolder ?? "");
-          results.push({ file, azuracast_id: uploaded.id ?? null, status: "ok" });
-        } catch (e) {
-          results.push({ file, status: "error", error: String(e) });
+          await mkdir(DOWNLOAD_DIR, { recursive: true });
+          job.status = "downloading";
+          job.message = `Descargando playlist (max ${max_tracks} tracks)...`;
+
+          const batchId = `pl_${job.id}`;
+          const outTemplate = join(DOWNLOAD_DIR, `${batchId}_%(playlist_index)s.%(ext)s`);
+          await ytdlpDownload(url, outTemplate, ["--playlist-end", String(max_tracks)]);
+
+          const files = (await readdir(DOWNLOAD_DIR)).filter(f => f.startsWith(batchId));
+          if (!files.length) throw new Error("No se descargo ningun archivo.");
+
+          job.status = "uploading";
+          job.message = `Subiendo ${files.length} tracks a AzuraCast...`;
+
+          const results = [];
+          for (const file of files.sort()) {
+            const filePath = join(DOWNLOAD_DIR, file);
+            try {
+              const uploaded = await uploadFileToAzura(filePath, station_id, subfolder ?? "");
+              results.push({ file, azuracast_id: uploaded.id ?? null, status: "ok" });
+            } catch (e) {
+              results.push({ file, status: "error", error: String(e) });
+            }
+          }
+          job.status = "done";
+          job.message = `${results.filter(r => r.status === "ok").length}/${results.length} tracks subidos`;
+          job.result = { success: true, total: results.length, tracks: results };
+        } catch (err) {
+          job.status = "error";
+          job.message = err instanceof Error ? err.message : String(err);
         }
-      }
+      })();
+
       return {
         content: [{ type: "text", text: JSON.stringify({
-          success: true, total: results.length, tracks: results,
+          job_id: job.id,
+          status: job.status,
+          message: "Playlist en background. Usa get_download_status para ver progreso.",
         }, null, 2) }],
       };
     }
