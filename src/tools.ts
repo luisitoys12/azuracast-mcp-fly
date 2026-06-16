@@ -27,7 +27,6 @@ function createJob(): Job {
   const id = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   const job: Job = { id, status: "pending", message: "En cola...", createdAt: Date.now() };
   jobs.set(id, job);
-  // Limpiar jobs viejos (> 2 horas)
   for (const [k, v] of jobs) {
     if (Date.now() - v.createdAt > 7_200_000) jobs.delete(k);
   }
@@ -76,8 +75,9 @@ async function uploadFileToAzura(
   const fileName = filePath.split("/").pop() ?? "track.mp3";
   const uploadPath = subfolder ? `${subfolder}/${fileName}` : fileName;
 
+  // AzuraCast API requires separate 'file' (binary) and 'path' (destination) fields
   const { stdout } = await execAsync(
-    `curl -s -X POST -H "X-API-Key: ${AZURA_KEY}" -F "file=@${filePath};filename=${uploadPath}" "${AZURA_URL}/api/station/${stationId}/files"`,
+    `curl -s -X POST -H "X-API-Key: ${AZURA_KEY}" -F "file=@${filePath}" -F "path=${uploadPath}" "${AZURA_URL}/api/station/${stationId}/files"`,
     { maxBuffer: 1024 * 1024 }
   );
 
@@ -292,7 +292,6 @@ export function registerTools(server: McpServer) {
     }
   );
 
-  // ── download_track (ASYNC) ────────────────────────────────────────────────
   server.tool("download_track",
     "Inicia la descarga en background de un track desde cualquier URL soportada por yt-dlp y lo sube a AzuraCast. Responde inmediatamente con un job_id. Usa get_download_status para consultar el progreso.",
     {
@@ -304,7 +303,6 @@ export function registerTools(server: McpServer) {
     },
     async ({ url, station_id, title, artist, subfolder }) => {
       const job = createJob();
-      // Lanzar en background — NO await
       runDownloadJob(job, url, station_id, subfolder ?? "", title, artist);
       return {
         content: [{ type: "text", text: JSON.stringify({
@@ -316,7 +314,6 @@ export function registerTools(server: McpServer) {
     }
   );
 
-  // ── get_download_status ───────────────────────────────────────────────────
   server.tool("get_download_status",
     "Consulta el estado de un job de descarga iniciado con download_track o download_playlist_ytdlp.",
     {
@@ -339,7 +336,6 @@ export function registerTools(server: McpServer) {
     }
   );
 
-  // ── download_playlist_ytdlp (ASYNC) ───────────────────────────────────────
   server.tool("download_playlist_ytdlp",
     "Descarga una playlist completa en background y sube todos los tracks a AzuraCast. Retorna job_id para consultar progreso con get_download_status.",
     {
@@ -351,7 +347,6 @@ export function registerTools(server: McpServer) {
     async ({ url, station_id, subfolder, max_tracks }) => {
       const job = createJob();
 
-      // Background
       (async () => {
         try {
           await mkdir(DOWNLOAD_DIR, { recursive: true });
