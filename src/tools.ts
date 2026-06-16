@@ -1,11 +1,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { execFile, exec } from "child_process";
+import { exec } from "child_process";
 import { promisify } from "util";
-import { readFile, unlink, readdir } from "fs/promises";
+import { unlink, readdir, stat } from "fs/promises";
+import { createReadStream } from "fs";
 import { join } from "path";
 
-const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
 
 const AZURA_URL = (process.env.AZURACAST_URL ?? "").replace(/\/$/, "");
@@ -41,6 +41,10 @@ function normalizeText(str: string): string {
     .split(" ").map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(" ");
 }
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Upload via curl para evitar cargar el archivo en RAM de Node
+// curl hace streaming directo desde disco → AzuraCast API
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 async function uploadFileToAzura(
   filePath: string,
   stationId: string | number,
@@ -49,24 +53,25 @@ async function uploadFileToAzura(
   metaArtist?: string
 ): Promise<Record<string, unknown>> {
   const fileName = filePath.split("/").pop() ?? "track.mp3";
-  const fileBuffer = await readFile(filePath);
-  const formData = new FormData();
-  const blob = new Blob([fileBuffer], { type: "audio/mpeg" });
   const uploadPath = subfolder ? `${subfolder}/${fileName}` : fileName;
-  formData.append("file", blob, uploadPath);
 
-  const uploadRes = await fetch(`${AZURA_URL}/api/station/${stationId}/files`, {
-    method: "POST",
-    headers: { "X-API-Key": AZURA_KEY },
-    body: formData,
-  });
-  if (!uploadRes.ok) {
-    const errText = await uploadRes.text();
-    throw new Error(`Error al subir a AzuraCast: ${uploadRes.status} - ${errText}`);
+  // Usar curl para stream directo desde disco sin pasar por RAM de Node
+  const curlCmd = [
+    `curl -s -X POST`,
+    `-H "X-API-Key: ${AZURA_KEY}"`,
+    `-F "file=@${filePath};filename=${uploadPath}"`,
+    `"${AZURA_URL}/api/station/${stationId}/files"`,
+  ].join(" ");
+
+  const { stdout } = await execAsync(curlCmd, { maxBuffer: 1024 * 1024 });
+  const uploaded = JSON.parse(stdout) as Record<string, unknown>;
+
+  if (!uploaded.id) {
+    throw new Error(`AzuraCast no retornó ID: ${stdout}`);
   }
-  const uploaded = await uploadRes.json() as Record<string, unknown>;
 
-  if (uploaded.id && (metaTitle || metaArtist)) {
+  // Actualizar metadata si se proporcionó
+  if (metaTitle || metaArtist) {
     const metaBody: Record<string, string> = {};
     if (metaTitle) metaBody["title"] = normalizeText(metaTitle);
     if (metaArtist) metaBody["artist"] = normalizeText(metaArtist);
@@ -75,8 +80,39 @@ async function uploadFileToAzura(
       body: JSON.stringify(metaBody),
     });
   }
+
+  // Limpiar archivo temporal
   await unlink(filePath).catch(() => {});
   return uploaded;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// yt-dlp con memoria limitada: sin buffer en RAM, escribe a disco
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+async function ytdlpDownload(url: string, outputTemplate: string, extraArgs: string[] = []): Promise<void> {
+  const args = [
+    "-x",
+    "--audio-format", "mp3",
+    "--audio-quality", "5",        // calidad media para reducir uso de ffmpeg
+    "--no-playlist",
+    "--buffer-size", "16K",        // buffer minimo en RAM
+    "--http-chunk-size", "1M",     // descarga en chunks de 1MB
+    "--no-part",                   // no archivo .part intermedio
+    "--no-mtime",
+    "--output", outputTemplate,
+    ...extraArgs,
+    url,
+  ].join(" ");
+
+  await execAsync(`yt-dlp ${args}`, {
+    maxBuffer: 512 * 1024,  // stdout/stderr max 512KB
+    timeout: 300000,         // timeout 5 minutos
+    env: {
+      ...process.env,
+      // Limitar memoria virtual de ffmpeg
+      MALLOC_ARENA_MAX: "2",
+    },
+  });
 }
 
 export function registerTools(server: McpServer) {
@@ -212,20 +248,24 @@ export function registerTools(server: McpServer) {
       subfolder: z.string().optional().default("").describe("Subcarpeta destino en AzuraCast (ej: 'podcasts')"),
     },
     async ({ url, station_id, title, artist, subfolder }) => {
-      const outTemplate = join(DOWNLOAD_DIR, "ytdlp_%(id)s.%(ext)s");
-      await execFileAsync("yt-dlp", [
-        "-x", "--audio-format", "mp3", "--audio-quality", "0",
-        "--no-playlist", "--output", outTemplate, url,
-      ]);
-      const files = (await readdir(DOWNLOAD_DIR)).filter(f => f.startsWith("ytdlp_") && f.endsWith(".mp3"));
-      if (!files.length) throw new Error("yt-dlp no generó ningún archivo mp3.");
-      const filePath = join(DOWNLOAD_DIR, files[files.length - 1]);
+      const fileId = `ytdlp_${Date.now()}`;
+      const outTemplate = join(DOWNLOAD_DIR, `${fileId}.%(ext)s`);
+
+      await ytdlpDownload(url, outTemplate);
+
+      const files = (await readdir(DOWNLOAD_DIR)).filter(f => f.startsWith(fileId));
+      if (!files.length) throw new Error("yt-dlp no genero ningun archivo.");
+      const filePath = join(DOWNLOAD_DIR, files[0]);
+
+      const fileStats = await stat(filePath);
       const uploaded = await uploadFileToAzura(filePath, station_id, subfolder ?? "", title, artist);
+
       return {
         content: [{ type: "text", text: JSON.stringify({
           success: true,
           message: `Track descargado y subido a estacion ${station_id}`,
-          file: files[files.length - 1],
+          file: files[0],
+          size_mb: (fileStats.size / 1024 / 1024).toFixed(2),
           azuracast_id: uploaded.id ?? null,
         }, null, 2) }],
       };
@@ -241,16 +281,16 @@ export function registerTools(server: McpServer) {
       max_tracks: z.number().optional().default(20).describe("Maximo de tracks a descargar (default 20)"),
     },
     async ({ url, station_id, subfolder, max_tracks }) => {
-      const outTemplate = join(DOWNLOAD_DIR, "pl_%(playlist_index)s_%(id)s.%(ext)s");
-      await execFileAsync("yt-dlp", [
-        "-x", "--audio-format", "mp3", "--audio-quality", "0",
-        "--playlist-end", String(max_tracks),
-        "--output", outTemplate, url,
-      ]);
-      const files = (await readdir(DOWNLOAD_DIR)).filter(f => f.startsWith("pl_") && f.endsWith(".mp3"));
-      if (!files.length) throw new Error("No se descargó ningún archivo.");
+      const batchId = `pl_${Date.now()}`;
+      const outTemplate = join(DOWNLOAD_DIR, `${batchId}_%(playlist_index)s.%(ext)s`);
+
+      await ytdlpDownload(url, outTemplate, ["--playlist-end", String(max_tracks)]);
+
+      const files = (await readdir(DOWNLOAD_DIR)).filter(f => f.startsWith(batchId));
+      if (!files.length) throw new Error("No se descargo ningun archivo.");
+
       const results = [];
-      for (const file of files) {
+      for (const file of files.sort()) {
         const filePath = join(DOWNLOAD_DIR, file);
         try {
           const uploaded = await uploadFileToAzura(filePath, station_id, subfolder ?? "");
@@ -261,9 +301,7 @@ export function registerTools(server: McpServer) {
       }
       return {
         content: [{ type: "text", text: JSON.stringify({
-          success: true,
-          total: results.length,
-          tracks: results,
+          success: true, total: results.length, tracks: results,
         }, null, 2) }],
       };
     }
@@ -277,21 +315,18 @@ export function registerTools(server: McpServer) {
       subfolder: z.string().optional().default("tidal").describe("Subcarpeta destino (default: 'tidal')"),
     },
     async ({ url, station_id, subfolder }) => {
-      // Inyectar credenciales desde env vars si existen
       const tidalToken = process.env.TIDAL_ACCESS_TOKEN ?? "";
       const tidalRefresh = process.env.TIDAL_REFRESH_TOKEN ?? "";
       if (!tidalToken) throw new Error("Falta TIDAL_ACCESS_TOKEN en Fly secrets. Configura: fly secrets set TIDAL_ACCESS_TOKEN=xxx");
 
-      // Parchear config de streamrip con token
-      const configPatch = `[tidal]\naccess_token = "${tidalToken}"\nrefresh_token = "${tidalRefresh}"\nquality = 1\n`;
       const { writeFile } = await import("fs/promises");
+      const configPatch = `[downloads]\nfolder = "${DOWNLOAD_DIR}"\n\n[tidal]\naccess_token = "${tidalToken}"\nrefresh_token = "${tidalRefresh}"\nquality = 1\n`;
       await writeFile("/root/.config/streamrip/config.toml", configPatch);
 
-      await execAsync(`rip url "${url}"`);
+      await execAsync(`rip url "${url}"`, { timeout: 300000, maxBuffer: 512 * 1024 });
 
-      // Buscar archivos descargados
       const files = (await readdir(DOWNLOAD_DIR)).filter(f => f.endsWith(".mp3") || f.endsWith(".flac"));
-      if (!files.length) throw new Error("streamrip no generó archivos de audio.");
+      if (!files.length) throw new Error("streamrip no genero archivos de audio.");
 
       const results = [];
       for (const file of files) {
@@ -323,14 +358,14 @@ export function registerTools(server: McpServer) {
       const password = process.env.QOBUZ_PASSWORD ?? "";
       if (!email || !password) throw new Error("Faltan QOBUZ_EMAIL y QOBUZ_PASSWORD en Fly secrets.");
 
-      const configPatch = `[qobuz]\nemail_or_userid = "${email}"\npassword_or_token = "${password}"\nquality = 1\n`;
       const { writeFile } = await import("fs/promises");
+      const configPatch = `[downloads]\nfolder = "${DOWNLOAD_DIR}"\n\n[qobuz]\nemail_or_userid = "${email}"\npassword_or_token = "${password}"\nquality = 1\n`;
       await writeFile("/root/.config/streamrip/config.toml", configPatch);
 
-      await execAsync(`rip url "${url}"`);
+      await execAsync(`rip url "${url}"`, { timeout: 300000, maxBuffer: 512 * 1024 });
 
       const files = (await readdir(DOWNLOAD_DIR)).filter(f => f.endsWith(".mp3") || f.endsWith(".flac"));
-      if (!files.length) throw new Error("streamrip no generó archivos de audio.");
+      if (!files.length) throw new Error("streamrip no genero archivos de audio.");
 
       const results = [];
       for (const file of files) {
