@@ -30,16 +30,37 @@ app.all("/mcp", async (req, res) => {
     }
   }
 
-  const server = new McpServer({ name: "azuracast-mcp", version: "1.0.0" });
-  registerTools(server);
+  try {
+    const server = new McpServer({ name: "azuracast-mcp", version: "1.0.0" });
+    registerTools(server);
 
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined,
-  });
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+    });
 
-  res.on("close", () => transport.close());
-  await server.connect(transport);
-  await transport.handleRequest(req, res, req.body);
+    res.on("close", () => transport.close());
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const stack = err instanceof Error ? err.stack : "";
+    console.error(`[azuracast-mcp-fly] ERROR en /mcp handler:`);
+    console.error(`[azuracast-mcp-fly] mensaje: ${message}`);
+    if (stack) console.error(`[azuracast-mcp-fly] stack: ${stack}`);
+    if (!res.headersSent) {
+      res.status(500).json({ error: message });
+    }
+  }
+});
+
+// Capturar errores no manejados para que aparezcan en fly logs
+process.on("uncaughtException", (err) => {
+  console.error(`[azuracast-mcp-fly] uncaughtException: ${err.message}`);
+  console.error(err.stack);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error(`[azuracast-mcp-fly] unhandledRejection:`, reason);
 });
 
 const PORT = parseInt(process.env.PORT ?? "8080");
