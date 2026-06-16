@@ -81,7 +81,13 @@ async function uploadFileToAzura(
     { maxBuffer: 1024 * 1024 }
   );
 
-  const uploaded = JSON.parse(stdout) as Record<string, unknown>;
+  let uploaded: Record<string, unknown>;
+  try {
+    uploaded = JSON.parse(stdout) as Record<string, unknown>;
+  } catch (parseErr) {
+    throw new Error(`AzuraCast upload failed (respuesta no JSON): ${stdout.trim()}`);
+  }
+
   if (!uploaded.id) throw new Error(`AzuraCast no retorno ID: ${stdout}`);
 
   if (metaTitle || metaArtist) {
