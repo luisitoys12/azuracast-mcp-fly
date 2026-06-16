@@ -1,4 +1,5 @@
 import express from "express";
+import { createServer } from "http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { validateEnv, registerTools } from "./tools.js";
@@ -6,7 +7,7 @@ import { validateEnv, registerTools } from "./tools.js";
 validateEnv();
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
 const MCP_TOKEN = process.env.MCP_API_TOKEN ?? "";
 
@@ -29,6 +30,10 @@ app.all("/mcp", async (req, res) => {
       return;
     }
   }
+
+  // Mantener conexion viva mientras yt-dlp descarga (Fly corta a los 60s sin datos)
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("Keep-Alive", "timeout=600");
 
   try {
     const server = new McpServer({ name: "azuracast-mcp", version: "1.0.0" });
@@ -64,7 +69,13 @@ process.on("unhandledRejection", (reason) => {
 });
 
 const PORT = parseInt(process.env.PORT ?? "8080");
-app.listen(PORT, "0.0.0.0", () => {
+
+// Crear server HTTP con timeouts extendidos para descargas largas
+const httpServer = createServer(app);
+httpServer.keepAliveTimeout = 620_000;   // 620 segundos
+httpServer.headersTimeout  = 630_000;   // ligeramente mayor que keepAliveTimeout
+
+httpServer.listen(PORT, "0.0.0.0", () => {
   console.log(`[azuracast-mcp-fly] Servidor HTTP en puerto ${PORT}`);
   console.log(`[azuracast-mcp-fly] MCP endpoint  -> http://0.0.0.0:${PORT}/mcp`);
   console.log(`[azuracast-mcp-fly] Health check  -> http://0.0.0.0:${PORT}/health`);
