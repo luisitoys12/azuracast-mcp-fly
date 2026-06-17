@@ -1,12 +1,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { execFile, exec } from "child_process";
+import { execFile } from "child_process";
 import { promisify } from "util";
-import { unlink, readdir, stat, mkdir } from "fs/promises";
+import { unlink, readdir, stat, mkdir, readFile } from "fs/promises";
 import { join } from "path";
 
 const execFileAsync = promisify(execFile);
-const execAsync = promisify(exec);
 
 const AZURA_URL = (process.env.AZURACAST_URL ?? "").replace(/\/$/, "");
 const AZURA_KEY = process.env.AZURACAST_API_KEY ?? "";
@@ -64,7 +63,7 @@ function normalizeText(str: string): string {
     .split(" ").map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(" ");
 }
 
-// ── Upload via curl ───────────────────────────────────────────────────────
+// ── Upload via JSON + base64 ──────────────────────────────────────────────────
 async function uploadFileToAzura(
   filePath: string,
   stationId: string | number,
@@ -75,20 +74,19 @@ async function uploadFileToAzura(
   const fileName = filePath.split("/").pop() ?? "track.mp3";
   const uploadPath = subfolder ? `${subfolder}/${fileName}` : fileName;
 
-  // AzuraCast API requires separate 'file' (binary) and 'path' (destination) fields
-  const { stdout } = await execAsync(
-    `curl -s -X POST -H "X-API-Key: ${AZURA_KEY}" -F "file=@${filePath}" -F "path=${uploadPath}" "${AZURA_URL}/api/station/${stationId}/files"`,
-    { maxBuffer: 1024 * 1024 }
-  );
+  // AzuraCast API: POST /api/station/{id}/files with JSON {path, file(base64)}
+  const fileBuffer = await readFile(filePath);
+  const fileBase64 = fileBuffer.toString("base64");
 
-  let uploaded: Record<string, unknown>;
-  try {
-    uploaded = JSON.parse(stdout) as Record<string, unknown>;
-  } catch (parseErr) {
-    throw new Error(`AzuraCast upload failed (respuesta no JSON): ${stdout.trim()}`);
-  }
+  const uploaded = await azuraFetch(`/api/station/${stationId}/files`, {
+    method: "POST",
+    body: JSON.stringify({
+      path: uploadPath,
+      file: `data:audio/mpeg;base64,${fileBase64}`,
+    }),
+  }) as Record<string, unknown>;
 
-  if (!uploaded.id) throw new Error(`AzuraCast no retorno ID: ${stdout}`);
+  if (!uploaded.id) throw new Error(`AzuraCast no retorno ID: ${JSON.stringify(uploaded)}`);
 
   if (metaTitle || metaArtist) {
     const metaBody: Record<string, string> = {};
@@ -407,7 +405,7 @@ export function registerTools(server: McpServer) {
       const { writeFile } = await import("fs/promises");
       const configPatch = `[downloads]\nfolder = "${DOWNLOAD_DIR}"\n\n[tidal]\naccess_token = "${tidalToken}"\nrefresh_token = "${tidalRefresh}"\nquality = 1\n`;
       await writeFile("/root/.config/streamrip/config.toml", configPatch);
-      await execAsync(`rip url "${url}"`, { timeout: 300000, maxBuffer: 512 * 1024 });
+      await execFileAsync("rip", ["url", url], { timeout: 300000, maxBuffer: 512 * 1024 });
 
       const files = (await readdir(DOWNLOAD_DIR)).filter(f => f.endsWith(".mp3") || f.endsWith(".flac"));
       if (!files.length) throw new Error("streamrip no genero archivos.");
@@ -439,7 +437,7 @@ export function registerTools(server: McpServer) {
       const { writeFile } = await import("fs/promises");
       const configPatch = `[downloads]\nfolder = "${DOWNLOAD_DIR}"\n\n[qobuz]\nemail_or_userid = "${email}"\npassword_or_token = "${password}"\nquality = 1\n`;
       await writeFile("/root/.config/streamrip/config.toml", configPatch);
-      await execAsync(`rip url "${url}"`, { timeout: 300000, maxBuffer: 512 * 1024 });
+      await execFileAsync("rip", ["url", url], { timeout: 300000, maxBuffer: 512 * 1024 });
 
       const files = (await readdir(DOWNLOAD_DIR)).filter(f => f.endsWith(".mp3") || f.endsWith(".flac"));
       if (!files.length) throw new Error("streamrip no genero archivos.");
